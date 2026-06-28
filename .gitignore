@@ -37,3 +37,13 @@ keys/
 
 __pycache__/
 requirements_orig.txt
+
+# Python virtual environment
+venv/
+
+# Runtime / generated storage (vector DB + RAG index)
+app/storage/
+
+# Temp / build artifacts
+temp.docx
+compilation.log
