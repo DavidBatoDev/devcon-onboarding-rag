@@ -3,7 +3,7 @@ from llama_index.core import Document
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from app.core.config import settings
-from app.services.drive_loader import get_drive_service
+from app.services.drive_loader import get_drive_service, _execute_with_retry
 import io
 import docx2txt
 import PyPDF2
@@ -25,8 +25,29 @@ except ImportError:
 
 class EnhancedDocumentProcessor:
     def __init__(self):
-        self.drive_service = get_drive_service()
-        self.google_docs_reader = GoogleDocsReader() if GoogleDocsReader else None
+        # Lazily initialized so the module can be imported without Google Drive
+        # credentials (e.g. an OpenAI-only deployment that only serves /ask).
+        # The Drive client is created on first use (during /rebuild or /files/fetch).
+        self._drive_service = None
+        self._google_docs_reader = None
+        self._google_docs_reader_initialized = False
+
+    @property
+    def drive_service(self):
+        if self._drive_service is None:
+            self._drive_service = get_drive_service()
+        return self._drive_service
+
+    @property
+    def google_docs_reader(self):
+        if not self._google_docs_reader_initialized:
+            try:
+                self._google_docs_reader = GoogleDocsReader() if GoogleDocsReader else None
+            except Exception as e:
+                logger.warning(f"GoogleDocsReader unavailable: {e}")
+                self._google_docs_reader = None
+            self._google_docs_reader_initialized = True
+        return self._google_docs_reader
     
     def process_drive_files(self, files: List[Dict[str, Any]]) -> List[Document]:
         """Process multiple files from Google Drive into LlamaIndex Documents"""
@@ -125,10 +146,10 @@ class EnhancedDocumentProcessor:
         
         # Fallback to manual export as plain text
         try:
-            exported = self.drive_service.files().export(
-                fileId=file_id, 
+            exported = _execute_with_retry(self.drive_service.files().export(
+                fileId=file_id,
                 mimeType="text/plain"
-            ).execute()
+            ))
             return exported.decode("utf-8")
         except Exception as e:
             logger.error(f"Failed to export Google Doc {file_id}: {e}")
@@ -206,10 +227,10 @@ class EnhancedDocumentProcessor:
         try:
             if mime_type == "application/vnd.google-apps.spreadsheet":
                 # Export Google Sheets as CSV
-                exported = self.drive_service.files().export(
-                    fileId=file_id, 
+                exported = _execute_with_retry(self.drive_service.files().export(
+                    fileId=file_id,
                     mimeType="text/csv"
-                ).execute()
+                ))
                 return exported.decode("utf-8")
             else:
                 # For Excel files, this would need additional processing
@@ -221,10 +242,10 @@ class EnhancedDocumentProcessor:
     def _extract_google_doc_title(self, file_id: str) -> str:
         """Get actual title from Google Doc (not just filename)"""
         try:
-            doc = self.drive_service.files().get(
-                fileId=file_id, 
+            doc = _execute_with_retry(self.drive_service.files().get(
+                fileId=file_id,
                 fields="name"
-            ).execute()
+            ))
             return doc.get('name', 'Untitled Document')
         except Exception as e:
             logger.error(f"Error getting Google Doc title: {e}")

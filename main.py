@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.api.v1.routes import router as v1_router
+from app.core.limiter import limiter
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 import os
 import uvicorn
 import time
@@ -20,6 +23,11 @@ async def lifespan(app: FastAPI):
     print("🔌 Shutting down...")
 
 app = FastAPI(lifespan=lifespan)
+
+# Rate limiting (SlowAPI). The limiter is applied per-route via decorators
+# (see app/api/v1/routes.py); here we register it and its 429 handler.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.get("/")
 def root_check():

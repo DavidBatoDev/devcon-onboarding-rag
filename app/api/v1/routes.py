@@ -1,11 +1,13 @@
 # backend/app/api/v1/routes.py
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 from app.api.v1.models import AskRequest, AskResponse, RefreshStatus, FileProcessingDetail
 from app.services.llamaindex_service import rag_service
 from app.services.document_processor import document_processor
 from app.services.drive_loader import get_drive_files
+from app.core.limiter import limiter
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import asyncio
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -15,6 +17,10 @@ import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Cap how many queries hit the LLM/embedding APIs concurrently so bursts of
+# traffic don't overwhelm the provider (or our rate limits).
+_query_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_QUERIES)
 
 
 class ServerStatusResponse(BaseModel):
@@ -36,10 +42,10 @@ async def get_server_status():
 class IndexStatsResponse(BaseModel):
     status: str
     document_count: int
-    chunk_size: int = None
-    chunk_overlap: int = None
-    top_k_retrieval: int = None
-    error: str = None
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    top_k_retrieval: Optional[int] = None
+    error: Optional[str] = None
 
 
 class FetchFilesRequest(BaseModel):
@@ -68,6 +74,7 @@ class RebuildRequest(BaseModel):
     folder_id: str = None  # Optional: specific folder to rebuild from
     batch_size: int = 25  # Batch size for processing
     file_ids: List[str] = None  # Optional: specific files to process
+    incremental: bool = False  # Only re-embed new/changed files instead of a full rebuild
 
 
 class RebuildResponse(BaseModel):
@@ -92,28 +99,40 @@ rebuild_lock = threading.Lock()
 
 
 @router.post("/ask", response_model=AskResponse)
-async def ask_question(request: AskRequest):
+@limiter.limit(settings.RATE_LIMIT_ASK)
+async def ask_question(request: Request, body: AskRequest):
     """Ask a question using the RAG system with conversation history"""
+    if not body.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    logger.info(f"Received query: {body.query}")
+    logger.info(f"History length: {len(body.history)}")
+
+    # Convert history to format expected by RAG service
+    history_context = [{"role": msg.role, "content": msg.content} for msg in body.history]
+
     try:
-        if not request.query.strip():
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-        logger.info(f"Received query: {request.query}")
-        logger.info(f"History length: {len(request.history)}")
-        
-        # Convert history to format expected by RAG service
-        history_context = []
-        for msg in request.history:
-            history_context.append({
-                "role": msg.role,
-                "content": msg.content
-            })
-        
-        # Query with history context
-        response = rag_service.query(request.query, history_context)
-        
-        return AskResponse(answer=response)
-    
+        # rag_service.query is synchronous/blocking; run it in a worker thread so
+        # the event loop stays responsive, behind a concurrency cap and timeout.
+        async with _query_semaphore:
+            answer = await asyncio.wait_for(
+                asyncio.to_thread(
+                    rag_service.query,
+                    body.query,
+                    history_context,
+                    body.top_k,
+                    body.temperature,
+                ),
+                timeout=settings.QUERY_TIMEOUT_SECONDS,
+            )
+        return AskResponse(answer=answer)
+
+    except asyncio.TimeoutError:
+        logger.error("Query timed out")
+        raise HTTPException(
+            status_code=504,
+            detail="The request took too long to process. Please try again.",
+        )
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
@@ -270,7 +289,26 @@ Note: Use /files/fetch first to see available files before rebuilding.
                 failed_files=0,
                 processing_time=time.time() - start_time
             )
-        
+
+        # Incremental path: only re-embed new/changed files, drop deleted ones.
+        if request.incremental:
+            logger.info("♻️ Running incremental update (new/changed files only)...")
+            summary = rag_service.incremental_update(files)
+            processing_time = time.time() - start_time
+            rebuild_state["last_status"] = "completed_incremental"
+            return RebuildResponse(
+                status="completed",
+                message=(
+                    f"Incremental update: {summary.get('added', 0)} added, "
+                    f"{summary.get('changed', 0)} changed, {summary.get('skipped', 0)} skipped, "
+                    f"{summary.get('deleted', 0)} deleted"
+                ),
+                processed_files=summary.get("added", 0) + summary.get("changed", 0),
+                failed_files=summary.get("failed", 0),
+                processing_time=processing_time,
+                files_details=[],
+            )
+
         # Step 2: Process files into LlamaIndex Documents
         logger.info("🔧 Processing documents...")
         documents = document_processor.process_drive_files(files)

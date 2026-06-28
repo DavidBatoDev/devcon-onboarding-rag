@@ -1,12 +1,37 @@
 # backend/app/services/drive_loader.py
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from app.core.config import settings
 import logging
 import os
 import json
 
 logger = logging.getLogger(__name__)
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """Retry only on transient Google API errors (rate limit / server errors)."""
+    if isinstance(exc, HttpError):
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            return False
+        return status == 429 or status >= 500
+    return False
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(settings.DRIVE_MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, max=30),
+    retry=retry_if_exception(_is_retryable_http_error),
+)
+def _execute_with_retry(request):
+    """Execute a Google API request with exponential backoff on transient errors."""
+    return request.execute()
 
 def get_drive_service():
     """Create and return Google Drive service client"""
@@ -81,12 +106,12 @@ def get_drive_files(folder_id: str = None):
         page_token = None
 
         while True:
-            results = service.files().list(
+            results = _execute_with_retry(service.files().list(
                 q=query,
                 pageSize=1000,
                 fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
                 pageToken=page_token
-            ).execute()
+            ))
 
             batch_files = results.get("files", [])
             files.extend(batch_files)
