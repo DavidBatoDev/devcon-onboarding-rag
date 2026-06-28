@@ -1,7 +1,7 @@
 """
-Enhanced compilation script for LlamaIndex RAG system with HF Inference API
-Processes Google Drive documents and builds the RAG index using BAAI/bge-large-en-v1.5 via HF API
-Updated to use huggingface_hub.InferenceClient with proper response handling
+Compilation script for the LlamaIndex RAG system (OpenAI-powered).
+Processes Google Drive documents and builds the RAG index using OpenAI
+embeddings (text-embedding-3-small) and the OpenAI LLM (gpt-4o-mini).
 """
 
 import sys
@@ -9,8 +9,7 @@ import logging
 from pathlib import Path
 from typing import List
 import time
-import numpy as np
-from huggingface_hub import InferenceClient
+from llama_index.core import Settings as LlamaSettings
 
 # Add project root to Python path
 project_root = Path(__file__).resolve().parents[1]
@@ -56,9 +55,8 @@ def print_banner():
     banner = """
     ╔══════════════════════════════════════════════════════════════╗
     ║                    DEVCON RAG COMPILER                       ║
-    ║            Enhanced with HF Inference API                   ║
-    ║              BAAI/bge-large-en-v1.5                        ║
-    ║                  Cloud-Powered Embeddings                   ║
+    ║                   Powered by OpenAI                          ║
+    ║          gpt-4o-mini  +  text-embedding-3-small             ║
     ╚══════════════════════════════════════════════════════════════╝
     """
     print(banner)
@@ -67,192 +65,51 @@ def print_banner():
 def validate_environment():
     """Validate that all required environment variables are set"""
     logger.info("Validating environment...")
-    
+
     required_settings = [
-        ("GEMINI_API_KEY", settings.GEMINI_API_KEY),
-        ("GOOGLE_SERVICE_ACCOUNT_JSON_DATA", settings.GOOGLE_SERVICE_ACCOUNT_JSON_DATA),
-        ("HUGGINGFACE_TOKEN", settings.HUGGINGFACE_TOKEN)
+        ("OPENAI_API_KEY", settings.OPENAI_API_KEY),
     ]
-    
-    missing_vars = []
-    for var_name, var_value in required_settings:
-        if not var_value:
-            missing_vars.append(var_name)
-    
+
+    # Google Drive must be configured via one of the supported methods.
+    if not settings.google_service_account_configured:
+        required_settings.append(("GOOGLE service account (any method)", None))
+
+    missing_vars = [name for name, value in required_settings if not value]
+
     if missing_vars:
         logger.error(f"Missing required configuration values: {missing_vars}")
-        logger.error("HUGGINGFACE_TOKEN is required for Inference API access")
+        logger.error("OPENAI_API_KEY and a Google Drive service account are required")
         sys.exit(1)
-    
+
     logger.info("Environment validation passed")
-    logger.info("Using Hugging Face Inference API (cloud-based)")
-    logger.info("No local GPU required - embeddings computed in the cloud")
-
-
-def test_hf_inference_api():
-    """Test Hugging Face Inference API connectivity using InferenceClient"""
-    logger.info("Testing Hugging Face Inference API...")
-    
-    try:
-        # Initialize the modern InferenceClient with token from settings
-        client = InferenceClient(
-            api_key=settings.HUGGINGFACE_TOKEN
-        )
-        
-        # Test with a simple feature extraction call
-        test_text = "Test API connectivity"
-        
-        logger.info("Testing API connectivity...")
-        
-        # Use the feature_extraction method
-        embeddings = client.feature_extraction(
-            text=test_text,
-            model=settings.EMBEDDING_MODEL
-        )
-        
-        # Fix: Proper handling of numpy array response
-        if embeddings is not None and len(embeddings) > 0:
-            # Convert to list if it's a numpy array
-            if isinstance(embeddings, np.ndarray):
-                embeddings = embeddings.tolist()
-            
-            logger.info("HF Inference API is responding correctly")
-            logger.info(f"Test embedding dimensions: {len(embeddings)}")
-            logger.info(f"Model: {settings.EMBEDDING_MODEL}")
-            logger.info("Embedding computation: Cloud-based via HF Inference API")
-            return True
-        else:
-            logger.error("API returned empty response")
-            return False
-        
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "401" in error_msg or "unauthorized" in error_msg:
-            logger.error("Invalid Hugging Face token")
-            logger.error("Please check your HUGGINGFACE_TOKEN in settings")
-        elif "404" in error_msg or "not found" in error_msg:
-            logger.error(f"Model {settings.EMBEDDING_MODEL} not found or not available")
-            logger.error("The model might be loading or temporarily unavailable")
-        elif "503" in error_msg or "loading" in error_msg:
-            logger.info("Model is loading on HF servers, this is normal for first use")
-            logger.info("The model will be available shortly...")
-            return True  # Consider this a success as the API is responding
-        else:
-            logger.error(f"Error testing HF Inference API: {e}")
-            logger.error("Please check your internet connection and HF token")
-        return False
-
-
-class HFInferenceEmbedding:
-    """Embedding class that uses HuggingFace InferenceClient"""
-    
-    def __init__(self, model_name: str = None):
-        self.model_name = model_name or settings.EMBEDDING_MODEL
-        self.client = InferenceClient(api_key=settings.HUGGINGFACE_TOKEN)
-        self._dimension = None
-    
-    def _process_embedding_response(self, embedding):
-        """Process embedding response to handle different formats"""
-        try:
-            # Convert numpy array to list if needed
-            if isinstance(embedding, np.ndarray):
-                if embedding.ndim == 2:
-                    # If 2D array, take first row
-                    return embedding[0].tolist()
-                else:
-                    return embedding.tolist()
-            
-            # Handle list format
-            if isinstance(embedding, list):
-                if len(embedding) > 0 and isinstance(embedding[0], list):
-                    # Multiple embeddings returned, take the first
-                    return embedding[0]
-                return embedding
-            
-            logger.error(f"Unexpected embedding format: {type(embedding)}")
-            return []
-            
-        except Exception as e:
-            logger.error(f"Error processing embedding response: {e}")
-            return []
-    
-    def get_embeddings(self, texts: List[str], batch_size: int = 10) -> List[List[float]]:
-        """Get embeddings for a list of texts"""
-        all_embeddings = []
-        
-        # Process in batches to respect rate limits
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            batch_embeddings = []
-            
-            for text in batch:
-                try:
-                    # Get embedding for single text
-                    embedding = self.client.feature_extraction(
-                        text=text,
-                        model=self.model_name
-                    )
-                    
-                    # Process the response properly
-                    processed_embedding = self._process_embedding_response(embedding)
-                    
-                    if processed_embedding:
-                        batch_embeddings.append(processed_embedding)
-                    else:
-                        logger.warning(f"Empty embedding returned for text: {text[:50]}...")
-                        continue
-                        
-                except Exception as e:
-                    logger.error(f"Error getting embedding for text: {e}")
-                    continue
-            
-            all_embeddings.extend(batch_embeddings)
-            
-            # Brief pause between batches
-            if i + batch_size < len(texts):
-                time.sleep(0.5)
-        
-        return all_embeddings
-    
-    def get_embedding(self, text: str) -> List[float]:
-        """Get embedding for a single text"""
-        embeddings = self.get_embeddings([text])
-        return embeddings[0] if embeddings else []
-    
-    @property
-    def dimension(self) -> int:
-        """Get embedding dimensions"""
-        if self._dimension is None:
-            test_embedding = self.get_embedding("test")
-            self._dimension = len(test_embedding) if test_embedding else 0
-        return self._dimension
+    logger.info(f"LLM: {settings.OPENAI_LLM_MODEL} | Embeddings: {settings.OPENAI_EMBED_MODEL}")
 
 
 def test_embedding_model():
-    """Test the embedding model via HF Inference API"""
-    logger.info("Testing BGE embedding model via HF Inference API...")
-    
+    """Test the OpenAI embedding model via a single sample call."""
+    logger.info("Testing OpenAI embedding model...")
+
     try:
-        # Create embedding instance
-        embedding_model = HFInferenceEmbedding(settings.EMBEDDING_MODEL)
-        
-        # Test with sample text
-        test_text = "Testing BGE embeddings for DEVCON documents via HF API"
-        embedding = embedding_model.get_embedding(test_text)
-        
+        embed_model = LlamaSettings.embed_model
+        embedding = embed_model.get_text_embedding(
+            "Testing OpenAI embeddings for DEVCON documents"
+        )
+
         if embedding and len(embedding) > 0:
-            logger.info("BGE model working successfully via HF Inference API")
-            logger.info(f"Model: {settings.EMBEDDING_MODEL}")
-            logger.info(f"API Type: HuggingFace InferenceClient")
+            logger.info("OpenAI embedding model working successfully")
+            logger.info(f"Model: {settings.OPENAI_EMBED_MODEL}")
             logger.info(f"Embedding dimensions: {len(embedding)}")
-            logger.info(f"Sample values: {embedding[:5]}...")
+            if len(embedding) != settings.EMBEDDING_DIM:
+                logger.warning(
+                    f"Embedding dim {len(embedding)} != configured EMBEDDING_DIM "
+                    f"{settings.EMBEDDING_DIM}; update config if you changed the model."
+                )
             return True
-        else:
-            logger.error("BGE model test failed: No embedding returned")
-            return False
-            
+        logger.error("Embedding test failed: No embedding returned")
+        return False
+
     except Exception as e:
-        logger.error(f"Error testing BGE model: {e}")
+        logger.error(f"Error testing OpenAI embedding model: {e}")
         return False
 
 
@@ -482,15 +339,10 @@ def main():
     try:
         # Validate environment
         validate_environment()
-        
-        # Test HF Inference API
-        if not test_hf_inference_api():
-            logger.error("HF Inference API test failed. Exiting.")
-            sys.exit(1)
-        
+
         # Test embedding model
         if not test_embedding_model():
-            logger.error("BGE model test failed. Exiting.")
+            logger.error("OpenAI embedding test failed. Exiting.")
             sys.exit(1)
         
         # Get initial stats
@@ -546,9 +398,9 @@ def main():
         
     except Exception as e:
         logger.error(f"Compilation failed: {e}")
-        if "api" in str(e).lower() or "inference" in str(e).lower():
+        if "api" in str(e).lower() or "rate" in str(e).lower():
             logger.error("This appears to be an API-related error")
-            logger.error("Please check your HuggingFace token and internet connection")
+            logger.error("Please check your OPENAI_API_KEY and internet connection")
         cleanup_temp_files()
         sys.exit(1)
 

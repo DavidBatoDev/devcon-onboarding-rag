@@ -8,244 +8,84 @@ from llama_index.core import (
 )
 from dotenv import load_dotenv
     
-from llama_index.llms.gemini import Gemini
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.response import Response
-from llama_index.core.embeddings import BaseEmbedding
+from llama_index.core.response_synthesizers import get_response_synthesizer
+from llama_index.core import PromptTemplate
+from llama_index.core.schema import QueryBundle
 from typing import List, Optional, Dict
-from pydantic import Field
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 import os
-import numpy as np
 import time
+import hashlib
+import threading
 from typing import List, Optional, Any
 from pathlib import Path
+from cachetools import TTLCache
 from app.core.config import settings
-from huggingface_hub import InferenceClient
 import logging
 import json
-from app.services.prompt_engine import DEVCONPromptEngine 
+from app.services.prompt_engine import DEVCONPromptEngine
 
 logger = logging.getLogger(__name__)
 
 
 load_dotenv() 
 
-class HuggingFaceInferenceEmbedding(BaseEmbedding):
-    """Custom embedding class using Hugging Face InferenceClient"""
-    
-    # Define Pydantic fields explicitly
-    model_name: str = Field(default="BAAI/bge-large-en-v1.5", description="HuggingFace model name")
-    api_key: Optional[str] = Field(default=None, description="HuggingFace API key")
-    timeout: int = Field(default=60, description="API timeout in seconds")
-    max_retries: int = Field(default=3, description="Maximum number of retries")
-    retry_delay: float = Field(default=1.0, description="Delay between retries")
-    normalize_embeddings: bool = Field(default=True, description="Whether to normalize embeddings")
-    
-    # These will be set during initialization
-    client: Optional[InferenceClient] = Field(default=None, init=False)
-    
-    def __init__(
-        self,
-        model_name: str = "BAAI/bge-large-en-v1.5",
-        api_key: Optional[str] = None,
-        timeout: int = 60,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-        normalize_embeddings: bool = True,
-        **kwargs
-    ):
-        super().__init__(
-            model_name=model_name,
-            api_key=api_key,
-            timeout=timeout,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            normalize_embeddings=normalize_embeddings,
-            **kwargs
-        )
-        
-        # Initialize the InferenceClient with the modern approach
-        self.client = InferenceClient(
-            api_key=self.api_key,
-            timeout=self.timeout
-        )
-        
-        print(f"✅ Initialized HF InferenceClient embedding: {self.model_name}")
-    
-    def _get_query_embedding(self, query: str) -> List[float]:
-        """Get embedding for a single query"""
-        return self._get_text_embedding(query)
-    
-    def _get_text_embedding(self, text: str) -> List[float]:
-        """Get embedding for a single text"""
-        return self._call_api([text])[0]
-    
-    def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings for multiple texts"""
-        return self._call_api(texts)
-    
-    def _call_api(self, texts: List[str]) -> List[List[float]]:
-        """Make API call to Hugging Face Inference API using InferenceClient"""
-        all_embeddings = []
-        
-        for attempt in range(self.max_retries):
-            try:
-                print(f"🔄 Getting embeddings for {len(texts)} texts (attempt {attempt + 1})")
-                
-                # Process texts one by one to handle API properly
-                batch_embeddings = []
-                for text in texts:
-                    try:
-                        # Use the feature_extraction method from InferenceClient
-                        embedding = self.client.feature_extraction(
-                            text=text,
-                            model=self.model_name
-                        )
-                        
-                        # Process the embedding response
-                        processed_embedding = self._process_embedding_response(embedding)
-                        if processed_embedding:
-                            batch_embeddings.append(processed_embedding)
-                        else:
-                            print(f"⚠️ Empty embedding for text: {text[:50]}...")
-                            # Return a zero vector as fallback
-                            batch_embeddings.append([0.0] * 1024)  # BGE-large dimension
-                            
-                    except Exception as text_error:
-                        print(f"⚠️ Error processing single text: {text_error}")
-                        # Return a zero vector as fallback
-                        batch_embeddings.append([0.0] * 1024)
-                        continue
-                
-                all_embeddings = batch_embeddings
-                
-                # Normalize embeddings if requested
-                if self.normalize_embeddings:
-                    all_embeddings = [self._normalize_embedding(emb) for emb in all_embeddings]
-                
-                print(f"✅ Got {len(all_embeddings)} embeddings, dim: {len(all_embeddings[0]) if all_embeddings else 0}")
-                return all_embeddings
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                print(f"⚠️ API request error (attempt {attempt + 1}): {e}")
-                
-                if "503" in error_msg or "loading" in error_msg:
-                    # Model is loading, wait and retry
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    print(f"⏳ Model loading, waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                elif "404" in error_msg:
-                    print(f"❌ Model not found: {self.model_name}")
-                    print("🔍 Check if model name is correct and accessible")
-                    raise Exception(f"Model not found: {self.model_name}")
-                elif "401" in error_msg or "unauthorized" in error_msg:
-                    print("❌ Unauthorized - check your HuggingFace token")
-                    raise Exception("Invalid HuggingFace API token")
-                elif "429" in error_msg or "rate limit" in error_msg:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    print(f"⏳ Rate limit hit, waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                
-                if attempt == self.max_retries - 1:
-                    raise Exception(f"Failed to get embeddings after {self.max_retries} attempts: {e}")
-                time.sleep(self.retry_delay * (attempt + 1))
-            
-        # If we get here, all attempts failed
-        raise Exception("Failed to get embeddings after all retry attempts")
-    
-    def _process_embedding_response(self, embedding) -> List[float]:
-        """Process embedding response to handle different formats"""
-        try:
-            # Convert numpy array to list if needed
-            if isinstance(embedding, np.ndarray):
-                if embedding.ndim == 2:
-                    # If 2D array, take first row
-                    return embedding[0].tolist()
-                else:
-                    return embedding.tolist()
-            
-            # Handle list format
-            if isinstance(embedding, list):
-                if len(embedding) > 0 and isinstance(embedding[0], list):
-                    # Multiple embeddings returned, take the first
-                    return embedding[0]
-                return embedding
-            
-            print(f"⚠️ Unexpected embedding format: {type(embedding)}")
-            return []
-            
-        except Exception as e:
-            print(f"❌ Error processing embedding response: {e}")
-            return []
-    
-    def _normalize_embedding(self, embedding: List[float]) -> List[float]:
-        """Normalize embedding vector to unit length"""
-        try:
-            embedding_array = np.array(embedding)
-            norm = np.linalg.norm(embedding_array)
-            if norm == 0:
-                return embedding
-            return (embedding_array / norm).tolist()
-        except Exception as e:
-            print(f"⚠️ Error normalizing embedding: {e}")
-            return embedding
-    
-    async def _aget_query_embedding(self, query: str) -> List[float]:
-        """Async version - fallback to sync for now"""
-        return self._get_query_embedding(query)
-    
-    async def _aget_text_embedding(self, text: str) -> List[float]:
-        """Async version - fallback to sync for now"""
-        return self._get_text_embedding(text)
-
 class LlamaIndexRAGService:
     def __init__(self):
         self.index: Optional[VectorStoreIndex] = None
         self.query_engine = None
+        # Query-result cache (TTL + size bounded). TTLCache is not thread-safe,
+        # so all access is guarded by this lock (queries run in worker threads).
+        self._query_cache = TTLCache(maxsize=settings.QUERY_CACHE_SIZE, ttl=settings.QUERY_CACHE_TTL)
+        self._query_cache_lock = threading.Lock()
         self._setup_llama_index()
         self._initialize_components()
         self.index_state_file = Path(settings.RAG_INDEX_DIR) / "index_state.json"
         self._load_index_state()
         self.prompt_engine = DEVCONPromptEngine(self)
-        self._ensure_directories_exist() 
+        self._ensure_directories_exist()
     
     def _setup_llama_index(self):
         """Configure LlamaIndex global settings"""
-        # Initialize Gemini LLM
-        llm = Gemini(
-            api_key=settings.GEMINI_API_KEY,
-            model="models/gemini-2.0-flash",
-            temperature=0.1,
+        if not settings.OPENAI_API_KEY:
+            logger.warning("⚠️ OPENAI_API_KEY is not set — LLM and embedding calls will fail until it is configured.")
+
+        # Initialize OpenAI LLM
+        llm = OpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            model=settings.OPENAI_LLM_MODEL,
+            temperature=settings.LLM_TEMPERATURE,
             max_tokens=settings.MAX_OUTPUT_TOKENS,
+            timeout=settings.OPENAI_REQUEST_TIMEOUT,
+            max_retries=settings.OPENAI_MAX_RETRIES,
         )
-        
-        # Initialize custom Hugging Face InferenceClient Embeddings
-        embed_model = HuggingFaceInferenceEmbedding(
-            model_name=settings.EMBEDDING_MODEL,
-            api_key=settings.HUGGINGFACE_TOKEN,
-            timeout=60,
-            max_retries=3,
-            retry_delay=1.0,
-            normalize_embeddings=settings.BGE_NORMALIZE_EMBEDDINGS,
+
+        # Initialize OpenAI embeddings
+        embed_model = OpenAIEmbedding(
+            api_key=settings.OPENAI_API_KEY,
+            model=settings.OPENAI_EMBED_MODEL,
+            embed_batch_size=settings.EMBEDDING_BATCH_SIZE,
+            timeout=settings.OPENAI_REQUEST_TIMEOUT,
+            max_retries=settings.OPENAI_MAX_RETRIES,
         )
-        
+
         # Configure global settings
         LlamaSettings.llm = llm
         LlamaSettings.embed_model = embed_model
         LlamaSettings.chunk_size = settings.CHUNK_SIZE
         LlamaSettings.chunk_overlap = settings.CHUNK_OVERLAP
-        
-        print(f"✅ Initialized {settings.EMBEDDING_MODEL} embeddings via HF InferenceClient")
+
+        print(f"✅ Initialized OpenAI LLM ({settings.OPENAI_LLM_MODEL}) and embeddings ({settings.OPENAI_EMBED_MODEL})")
     
     def _initialize_components(self):
         """Initialize vector store and other components"""
@@ -256,7 +96,7 @@ class LlamaIndexRAGService:
         )
         
         # Get or create collection with NO embedding function
-        collection_name = "devcon_documents_hf_client"  # Updated name for HF InferenceClient
+        collection_name = settings.CHROMA_COLLECTION_NAME  # OpenAI 1536-dim collection
         try:
             chroma_collection = chroma_client.get_collection(collection_name)
             print(f"✅ Loaded existing ChromaDB collection: {collection_name}")
@@ -456,27 +296,84 @@ class LlamaIndexRAGService:
         return False
 
     def _setup_query_engine(self):
-        """Setup the query engine with optimized settings for BGE embeddings"""
+        """Setup a baseline query engine (used as a readiness check).
+
+        The main answering path uses _retrieve_and_synthesize(), which adds
+        query condensation and reranking on top of this retriever.
+        """
         if not self.index:
             return
-            
-        # Create retriever with higher top-k for better recall
+
+        # Retrieve a wide candidate set for better recall.
         retriever = VectorIndexRetriever(
             index=self.index,
-            similarity_top_k=settings.TOP_K_RETRIEVAL * 2,  # Retrieve more candidates
+            similarity_top_k=settings.RETRIEVE_CANDIDATES,
         )
-        
-        # Use a lower similarity cutoff for BGE embeddings (they have different score ranges)
-        # BGE embeddings often have lower similarity scores, so we need a more permissive threshold
-        postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)  # Lowered from 0.5
-        
+
+        postprocessor = SimilarityPostprocessor(similarity_cutoff=settings.SIMILARITY_CUTOFF)
+
         # Create query engine
         self.query_engine = RetrieverQueryEngine(
             retriever=retriever,
             node_postprocessors=[postprocessor],
         )
-        
-        print(f"✅ Query engine configured with similarity_cutoff=0.3, top_k={settings.TOP_K_RETRIEVAL * 2}")
+
+        print(f"✅ Query engine configured with similarity_cutoff={settings.SIMILARITY_CUTOFF}, "
+              f"candidates={settings.RETRIEVE_CANDIDATES}")
+
+    def _condense_question(self, question: str, history: List[Dict[str, str]]) -> str:
+        """Rewrite a follow-up question into a standalone retrieval query using
+        recent conversation history. Improves retrieval for pronoun/elliptical
+        follow-ups (e.g. "who runs it?")."""
+        if not history or not settings.ENABLE_QUERY_CONDENSE:
+            return question
+        try:
+            turns = history[-settings.CONDENSE_HISTORY_TURNS:]
+            convo = "\n".join(
+                f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in turns
+            )
+            prompt = (
+                "Given the conversation below and a follow-up message, rewrite the follow-up "
+                "as a standalone, self-contained search query. Resolve pronouns and references "
+                "using the conversation. Return ONLY the rewritten query, nothing else.\n\n"
+                f"Conversation:\n{convo}\n\nFollow-up: {question}\n\nStandalone query:"
+            )
+            condensed = str(LlamaSettings.llm.complete(prompt)).strip()
+            # Guard against the model returning something empty or absurdly long
+            if condensed and len(condensed) <= 1000:
+                logger.info(f"🔁 Condensed query: {condensed}")
+                return condensed
+        except Exception as e:
+            logger.warning(f"⚠️ Query condensation failed, using original question: {e}")
+        return question
+
+    def _postprocess_nodes(self, nodes, query_str: str, top_k: int):
+        """Apply similarity cutoff then (optionally) LLM reranking, returning the
+        final top_k nodes used for both the context prompt and synthesis."""
+        if not nodes:
+            return nodes
+        query_bundle = QueryBundle(query_str)
+
+        # 1. Drop clearly-irrelevant nodes by similarity score.
+        try:
+            nodes = SimilarityPostprocessor(
+                similarity_cutoff=settings.SIMILARITY_CUTOFF
+            ).postprocess_nodes(nodes, query_bundle=query_bundle)
+        except Exception as e:
+            logger.warning(f"⚠️ Similarity postprocessing failed: {e}")
+
+        # 2. Rerank the survivors with the LLM for relevance, keep top_k.
+        if settings.ENABLE_RERANK and nodes:
+            try:
+                from llama_index.core.postprocessor import LLMRerank
+                reranker = LLMRerank(top_n=top_k, choice_batch_size=5)
+                nodes = reranker.postprocess_nodes(nodes, query_bundle=query_bundle)
+            except Exception as e:
+                logger.warning(f"⚠️ LLM rerank failed, falling back to similarity order: {e}")
+                nodes = nodes[:top_k]
+        else:
+            nodes = nodes[:top_k]
+        return nodes
 
     def _format_conversation_history(self, history: List[Dict[str, str]]) -> str:
         """Format conversation history into a readable context string"""
@@ -513,33 +410,56 @@ class LlamaIndexRAGService:
         
         return enhanced_prompt
 
-    def _create_history_aware_anti_hallucination_engine(self, question: str, history: List[Dict[str, str]] = None):
-        """Create query engine that considers conversation history AND prevents hallucinations"""
-        from llama_index.core import PromptTemplate
-        from llama_index.core.response_synthesizers import get_response_synthesizer
-        
+    def _get_retriever(self, candidates: int):
+        """Build the retriever. Vector-only by default; hybrid (BM25 + vector)
+        when ENABLE_HYBRID_SEARCH is on and an in-memory node corpus is available."""
+        vector_retriever = VectorIndexRetriever(index=self.index, similarity_top_k=candidates)
+        if not settings.ENABLE_HYBRID_SEARCH:
+            return vector_retriever
+        try:
+            from llama_index.retrievers.bm25 import BM25Retriever
+            from llama_index.core.retrievers import QueryFusionRetriever
+            nodes = list(self.index.docstore.docs.values())
+            if not nodes:
+                logger.warning("⚠️ Hybrid search on but docstore is empty; using vector retriever only.")
+                return vector_retriever
+            bm25 = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=settings.BM25_TOP_K)
+            return QueryFusionRetriever(
+                [vector_retriever, bm25],
+                similarity_top_k=candidates,
+                num_queries=1,
+                mode="reciprocal_rerank",
+                use_async=False,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Hybrid search unavailable ({e}); using vector retriever only.")
+            return vector_retriever
+
+    def _create_history_aware_anti_hallucination_engine(self, question: str, history: List[Dict[str, str]] = None,
+                                                        top_k: int = None, temperature: float = None):
+        """Retrieve, rerank, and synthesize a grounded answer that is aware of
+        conversation history. Returns ``(response, error, retrieval_query)`` where
+        ``response`` is an already-executed LlamaIndex Response (or None on error)."""
         # Format conversation history
         conversation_context = self._format_conversation_history(history) if history else ""
-        
-        # Enhanced query with history context
-        enhanced_query = self._create_history_aware_prompt(question, history) if history else question
-        
-        # First retrieve relevant nodes using enhanced query
-        retriever = VectorIndexRetriever(
-            index=self.index,
-            similarity_top_k=settings.TOP_K_RETRIEVAL * 2,
-        )
-        
-        nodes = retriever.retrieve(enhanced_query)
-        
+
+        # Condense follow-ups into a standalone retrieval query (history-aware).
+        retrieval_query = self._condense_question(question, history) if history else question
+
+        # Retrieve a wide candidate set, then rerank/filter down to top_k.
+        final_top_k = top_k or settings.TOP_K_RETRIEVAL
+        retriever = self._get_retriever(settings.RETRIEVE_CANDIDATES)
+        nodes = retriever.retrieve(retrieval_query)
+        nodes = self._postprocess_nodes(nodes, retrieval_query, final_top_k)
+
         # Check if we have meaningful context
         has_relevant_context = bool(nodes) and any(
             node.text.strip() for node in nodes if node.text.strip()
         )
-        
+
         if not nodes:
-            return None, "No relevant documents found for your question.", enhanced_query
-        
+            return None, "No relevant documents found for your question.", retrieval_query
+
         # Create context-aware prompt using the enhanced prompt engine if available
         if hasattr(self, 'prompt_engine') and self.prompt_engine:
             # Use the enhanced context prompt that handles both scenarios
@@ -547,7 +467,7 @@ class LlamaIndexRAGService:
         else:
             # Fallback to basic context prompt
             context_prompt = self._create_basic_context_prompt(nodes, question, has_relevant_context)
-        
+
         # Updated QA template with enhanced context prioritization
         qa_template_str = """{context_prompt}
 
@@ -580,23 +500,34 @@ Answer:"""
         
         # Insert the context prompt (which now includes conversation history if needed)
         formatted_template = qa_template_str.replace("{context_prompt}", context_prompt)
-        
+
         qa_template = PromptTemplate(formatted_template)
-        
-        # Create response synthesizer with enhanced template
+
+        # Optional per-request temperature override.
+        synth_llm = None
+        if temperature is not None:
+            try:
+                synth_llm = OpenAI(
+                    api_key=settings.OPENAI_API_KEY,
+                    model=settings.OPENAI_LLM_MODEL,
+                    temperature=temperature,
+                    max_tokens=settings.MAX_OUTPUT_TOKENS,
+                    timeout=settings.OPENAI_REQUEST_TIMEOUT,
+                    max_retries=settings.OPENAI_MAX_RETRIES,
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Could not apply temperature override: {e}")
+
+        # Create response synthesizer with the enhanced template and synthesize
+        # directly over the already-reranked nodes (avoids a second retrieval).
         response_synthesizer = get_response_synthesizer(
             text_qa_template=qa_template,
-            response_mode="compact"
+            response_mode="compact",
+            llm=synth_llm,
         )
-        
-        # Create postprocessor with balanced threshold for relevance
-        postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)
-        
-        return RetrieverQueryEngine(
-            retriever=retriever,
-            response_synthesizer=response_synthesizer,
-            node_postprocessors=[postprocessor],
-        ), None, enhanced_query
+
+        response = response_synthesizer.synthesize(question, nodes=nodes)
+        return response, None, retrieval_query
 
     def _create_basic_context_prompt(self, context_nodes, question: str, has_relevant_context: bool) -> str:
         """Fallback context prompt when prompt engine is not available"""
@@ -636,39 +567,26 @@ QUESTION: {question}
 5. 🤔 If unsure about something, say so rather than guessing"""
 
 
-    def query_with_history_and_verification(self, question: str, history: List[Dict[str, str]] = None) -> str:
+    def query_with_history_and_verification(self, question: str, history: List[Dict[str, str]] = None,
+                                            top_k: int = None, temperature: float = None) -> str:
         """Main query method that handles conversation history AND prevents hallucinations"""
         try:
             if not self.query_engine:
                 return "❌ RAG system not initialized. Please add documents first."
-            
+
             if history is None:
                 history = []
-            
-            print(f"🔍 Processing query with {len(history)} history messages")
-            
-            # Enhanced query processing with history context
-            if history:
-                enhanced_question = self._create_history_aware_prompt(question, history)
-            else:
-                # Use prompt engine if available for single queries
-                if hasattr(self, 'prompt_engine') and self.prompt_engine:
-                    enhanced_question = self.prompt_engine.enhance_query(question)
-                else:
-                    enhanced_question = question
-            
-            print(f"🔍 Enhanced query: {enhanced_question}")
 
-            # Create history-aware anti-hallucination engine
-            custom_engine, error, final_query = self._create_history_aware_anti_hallucination_engine(question, history)
-            
+            print(f"🔍 Processing query with {len(history)} history messages")
+
+            # Retrieve, rerank and synthesize a grounded answer (history-aware).
+            response, error, final_query = self._create_history_aware_anti_hallucination_engine(
+                question, history, top_k=top_k, temperature=temperature
+            )
+
             if error:
                 return f"❌ {error}"
-            
-            # Query with both history context and verification safeguards
-            print("🚀 Querying with conversation history context and enhanced context prioritization...")
-            response = custom_engine.query(final_query)
-            
+
             # Verify response quality
             if not response.response or response.response.strip() in ["Empty Response", "", "I don't know"]:
                 return "❌ I don't have enough relevant information in the available documents to answer your question accurately."
@@ -736,13 +654,11 @@ QUESTION: {question}
         try:
             # If force_show_references is specified, we need to control the reference display
             if force_show_references is not None:
-                # Get the query engine and response directly to control reference display
-                custom_engine, error, final_query = self._create_history_aware_anti_hallucination_engine(question, history)
+                # Get the synthesized response directly to control reference display
+                query_response, error, final_query = self._create_history_aware_anti_hallucination_engine(question, history)
                 if error:
                     return f"❌ Error creating query engine: {error}"
-                
-                query_response = custom_engine.query(final_query)
-                
+
                 # Extract the response text without any existing source sections
                 response_text = query_response.response
                 
@@ -797,9 +713,43 @@ QUESTION: {question}
             return f"❌ I encountered an error while processing your question. Please try rephrasing or contact support."
 
     # Update the main query method to use the merged functionality
-    def query(self, question: str, history: List[Dict[str, str]] = None) -> str:
-        """Main query method that handles both history and verification"""
-        return self.query_with_history_and_verification(question, history)
+    def query(self, question: str, history: List[Dict[str, str]] = None,
+              top_k: int = None, temperature: float = None) -> str:
+        """Main query method that handles both history and verification, with caching."""
+        if not settings.ENABLE_QUERY_CACHE:
+            return self.query_with_history_and_verification(question, history, top_k, temperature)
+
+        key = self._query_cache_key(question, history, top_k, temperature)
+        with self._query_cache_lock:
+            cached = self._query_cache.get(key)
+        if cached is not None:
+            logger.info("⚡ Query cache hit")
+            return cached
+
+        answer = self.query_with_history_and_verification(question, history, top_k, temperature)
+
+        # Only cache successful answers (don't cache error placeholders)
+        if answer and not answer.lstrip().startswith("❌"):
+            with self._query_cache_lock:
+                self._query_cache[key] = answer
+        return answer
+
+    def _query_cache_key(self, question, history, top_k, temperature) -> str:
+        """Build a stable cache key from the question + history + retrieval params."""
+        hist = json.dumps(history or [], sort_keys=True, default=str)
+        raw = f"{(question or '').strip().lower()}|{hist}|{top_k}|{temperature}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _invalidate_query_cache(self):
+        """Clear the query-result cache (call after the corpus changes)."""
+        try:
+            cache = getattr(self, "_query_cache", None)
+            if cache is not None:
+                with self._query_cache_lock:
+                    cache.clear()
+                logger.info("🧹 Query cache cleared")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to clear query cache: {e}")
 
     def test_retrieval_scores(self, test_query: str = "DEVCON") -> dict:
         """Test retrieval scores to help tune similarity thresholds"""
@@ -872,10 +822,10 @@ QUESTION: {question}
                 "chunk_size": settings.CHUNK_SIZE,
                 "chunk_overlap": settings.CHUNK_OVERLAP,
                 "top_k_retrieval": settings.TOP_K_RETRIEVAL,
-                "embedding_model": settings.EMBEDDING_MODEL,
-                "embedding_api": "Hugging Face InferenceClient",
-                "embedding_dimensions": 1024 if "bge-large" in settings.EMBEDDING_MODEL else 768,
-                "normalize_embeddings": settings.BGE_NORMALIZE_EMBEDDINGS,
+                "embedding_model": settings.OPENAI_EMBED_MODEL,
+                "embedding_api": "OpenAI",
+                "embedding_dimensions": settings.EMBEDDING_DIM,
+                "llm_model": settings.OPENAI_LLM_MODEL,
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -906,7 +856,7 @@ QUESTION: {question}
             )
             
             # Use a temporary collection name
-            temp_collection_name = "devcon_documents_hf_client_temp"
+            temp_collection_name = f"{settings.CHROMA_COLLECTION_NAME}_temp"
             
             # Delete existing temp collection if it exists
             try:
@@ -969,51 +919,9 @@ QUESTION: {question}
                 if hasattr(node, 'metadata') and node.metadata:
                     node.metadata = self._sanitize_metadata(node.metadata)
             
-            # COMPLETE RE-EMBEDDING: Generate fresh embeddings for all nodes
-            logger.info("🔄 Generating fresh embeddings for all nodes (this may take a while)...")
-            embed_model = LlamaSettings.embed_model
-            
-            # Process nodes in batches to avoid memory issues and provide progress updates
-            batch_size = 10
-            total_batches = (len(nodes) + batch_size - 1) // batch_size
-            
-            for i in range(0, len(nodes), batch_size):
-                batch_nodes = nodes[i:i + batch_size]
-                batch_num = i // batch_size + 1
-                
-                logger.info(f"🔄 Processing embedding batch {batch_num}/{total_batches} ({len(batch_nodes)} nodes)")
-                
-                # Generate fresh embeddings for this batch
-                for node_idx, node in enumerate(batch_nodes):
-                    try:
-                        # Force fresh embedding generation - ignore any existing embeddings
-                        node.embedding = None  # Clear any existing embedding
-                        
-                        # Generate new embedding from scratch
-                        embedding = embed_model._get_text_embedding(node.text)
-                        
-                        # Validate embedding
-                        if embedding is None or len(embedding) == 0:
-                            logger.warning(f"⚠️ Empty embedding generated for node {i + node_idx}, using zero vector")
-                            embedding = [0.0] * 1024  # BGE-large dimension
-                        
-                        node.embedding = embedding
-                        logger.debug(f"✅ Generated fresh embedding for node {i + node_idx}: {len(embedding)} dims")
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Failed to generate embedding for node {i + node_idx}: {e}")
-                        # Use zero vector as fallback
-                        node.embedding = [0.0] * 1024
-                        continue
-                
-                # Add progress indicator
-                if batch_num % 5 == 0 or batch_num == total_batches:
-                    logger.info(f"📊 Embedding progress: {batch_num}/{total_batches} batches completed")
-            
-            logger.info("✅ All embeddings generated successfully!")
-            
-            # Add to temporary index with fresh embeddings
-            logger.info("🔄 Adding nodes with fresh embeddings to temporary index...")
+            # Insert nodes - LlamaIndex auto-embeds them in batches via the
+            # configured OpenAI embedding model (with built-in batching + retry).
+            logger.info("🔄 Embedding nodes and adding them to the temporary index (this may take a while)...")
             self.temp_index.insert_nodes(nodes)
             
             # Update temporary index state
@@ -1073,51 +981,9 @@ QUESTION: {question}
                 if hasattr(node, 'metadata') and node.metadata:
                     node.metadata = self._sanitize_metadata(node.metadata)
             
-            # Step 4: Generate fresh embeddings for all nodes
-            logger.info("🔄 Generating fresh embeddings for all nodes (this may take a while)...")
-            embed_model = LlamaSettings.embed_model
-            
-            # Process nodes in batches to avoid memory issues and provide progress updates
-            batch_size = 10
-            total_batches = (len(nodes) + batch_size - 1) // batch_size
-            
-            for i in range(0, len(nodes), batch_size):
-                batch_nodes = nodes[i:i + batch_size]
-                batch_num = i // batch_size + 1
-                
-                logger.info(f"🔄 Processing embedding batch {batch_num}/{total_batches} ({len(batch_nodes)} nodes)")
-                
-                # Generate fresh embeddings for this batch
-                for node_idx, node in enumerate(batch_nodes):
-                    try:
-                        # Force fresh embedding generation - ignore any existing embeddings
-                        node.embedding = None  # Clear any existing embedding
-                        
-                        # Generate new embedding from scratch
-                        embedding = embed_model._get_text_embedding(node.text)
-                        
-                        # Validate embedding
-                        if embedding is None or len(embedding) == 0:
-                            logger.warning(f"⚠️ Empty embedding generated for node {i + node_idx}, using zero vector")
-                            embedding = [0.0] * 1024  # BGE-large dimension
-                        
-                        node.embedding = embedding
-                        logger.debug(f"✅ Generated fresh embedding for node {i + node_idx}: {len(embedding)} dims")
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Failed to generate embedding for node {i + node_idx}: {e}")
-                        # Use zero vector as fallback
-                        node.embedding = [0.0] * 1024
-                        continue
-                
-                # Add progress indicator
-                if batch_num % 5 == 0 or batch_num == total_batches:
-                    logger.info(f"📊 Embedding progress: {batch_num}/{total_batches} batches completed")
-            
-            logger.info("✅ All embeddings generated successfully!")
-            
-            # Step 5: Add all nodes to the clean index
-            logger.info("🔄 Adding all nodes with fresh embeddings to index...")
+            # Step 4: Insert nodes - LlamaIndex auto-embeds them in batches via the
+            # configured OpenAI embedding model (with built-in batching + retry).
+            logger.info("🔄 Embedding nodes and adding them to the index (this may take a while)...")
             self.index.insert_nodes(nodes)
             
             # Step 6: Update index state
@@ -1142,17 +1008,100 @@ QUESTION: {question}
             
             # Step 8: Persist index
             self.persist_index()
-            
+
+            # Invalidate any cached query results (the corpus changed)
+            self._invalidate_query_cache()
+
             logger.info("✅ COMPLETE INDEX REBUILD successful!")
             logger.info(f"🎉 Rebuilt index with {len(documents)} documents and {len(nodes)} chunks")
             logger.info("🗑️ All old embeddings and .bin files have been completely replaced")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ Error in complete index rebuild: {e}")
             import traceback
             traceback.print_exc()
             return False
+
+    def incremental_update(self, drive_files: List[Dict[str, Any]]) -> dict:
+        """Incrementally sync the index with Google Drive.
+
+        Only re-embeds files that are new or whose ``modifiedTime`` changed since
+        the last run, removes files that disappeared from Drive, and skips
+        everything unchanged. Falls back to far less embedding cost than a full
+        rebuild. Returns a summary dict.
+        """
+        from app.services.document_processor import document_processor
+
+        summary = {"added": 0, "changed": 0, "skipped": 0, "deleted": 0, "failed": 0,
+                   "added_files": [], "changed_files": [], "deleted_files": []}
+        try:
+            if self.index is None:
+                self._load_or_create_index()
+
+            current_ids = set()
+            to_process = []  # files that are new or changed
+
+            for f in drive_files:
+                file_id = f.get("id")
+                if not file_id:
+                    continue
+                current_ids.add(file_id)
+                modified_time = f.get("modifiedTime", "Unknown")
+                state = self.index_state.get(file_id)
+
+                if state is None:
+                    summary["added"] += 1
+                    summary["added_files"].append(f.get("name", file_id))
+                    to_process.append(f)
+                elif str(state.get("modified_time")) != str(modified_time):
+                    summary["changed"] += 1
+                    summary["changed_files"].append(f.get("name", file_id))
+                    to_process.append(f)
+                else:
+                    summary["skipped"] += 1
+
+            # Files present in state but no longer in Drive -> delete
+            deleted_ids = [fid for fid in list(self.index_state.keys()) if fid not in current_ids]
+            for fid in deleted_ids:
+                name = self.index_state.get(fid, {}).get("file_name", fid)
+                if self.remove_document(fid):
+                    summary["deleted"] += 1
+                    summary["deleted_files"].append(name)
+
+            # Changed files: remove the old version before re-inserting the new one
+            changed_ids = {f.get("id") for f in to_process if self.index_state.get(f.get("id"))}
+            for fid in changed_ids:
+                self.remove_document(fid)
+
+            logger.info(
+                f"🔁 Incremental update: {summary['added']} added, {summary['changed']} changed, "
+                f"{summary['skipped']} skipped, {summary['deleted']} deleted"
+            )
+
+            if to_process:
+                documents = document_processor.process_drive_files(to_process)
+                summary["failed"] = len(to_process) - len(documents)
+                if documents:
+                    # add_documents handles chunking, embedding, state update + persist
+                    if not self.add_documents(documents):
+                        logger.error("❌ Incremental update failed while adding documents")
+                        summary["error"] = "add_documents failed"
+            else:
+                # Nothing new, but deletions may have changed the index -> persist + save
+                if deleted_ids:
+                    self.persist_index()
+                self.save_index_state()
+
+            self._invalidate_query_cache()
+            return summary
+
+        except Exception as e:
+            logger.error(f"❌ Error during incremental update: {e}")
+            import traceback
+            traceback.print_exc()
+            summary["error"] = str(e)
+            return summary
 
     def test_embedding(self, text: str = "This is a test sentence.") -> dict:
         """Test the embedding model"""
@@ -1165,9 +1114,8 @@ QUESTION: {question}
                 "text": text,
                 "embedding_dim": len(embedding),
                 "embedding_sample": embedding[:5],  # First 5 dimensions
-                "model_name": embed_model.model_name,
-                "api_type": "Hugging Face InferenceClient",
-                "normalized": embed_model.normalize_embeddings
+                "model_name": settings.OPENAI_EMBED_MODEL,
+                "api_type": "OpenAI",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -1181,7 +1129,7 @@ QUESTION: {question}
                 path=settings.CHROMA_PERSIST_DIR,
                 settings=ChromaSettings(anonymized_telemetry=False)
             )
-            collection_name = "devcon_documents_hf_client"
+            collection_name = settings.CHROMA_COLLECTION_NAME
             try:
                 chroma_client.delete_collection(collection_name)
                 logger.info(f"✅ Deleted ChromaDB collection: {collection_name}")
@@ -1245,7 +1193,10 @@ QUESTION: {question}
             
             # Save fresh index state (this will now create the directory if needed)
             self.save_index_state()
-            
+
+            # Drop any cached answers tied to the now-deleted corpus
+            self._invalidate_query_cache()
+
             logger.info("✅ Index completely cleared and reset - all storage files deleted")
             return True
             

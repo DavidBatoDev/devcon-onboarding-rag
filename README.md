@@ -3,10 +3,10 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115.13-009688?style=flat&logo=fastapi)](https://fastapi.tiangolo.com/)
 [![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.12.43-FF6B35?style=flat)](https://www.llamaindex.ai/)
 [![ChromaDB](https://img.shields.io/badge/ChromaDB-1.0.13-FF4B4B?style=flat)](https://www.trychroma.com/)
-[![Google Gemini](https://img.shields.io/badge/Google_Gemini-2.0_Flash-4285F4?style=flat&logo=google)](https://ai.google.dev/)
+[![OpenAI](https://img.shields.io/badge/OpenAI-gpt--4o--mini-412991?style=flat&logo=openai)](https://platform.openai.com/)
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat&logo=python)](https://www.python.org/)
 
-DEBBIE (Developer Virtual Intelligence Engine) is an advanced RAG (Retrieval-Augmented Generation) chatbot that intelligently processes and understands your Google Drive documents. Built with **LlamaIndex** for superior document chunking and retrieval, powered by **Google Gemini 2.0 Flash** for lightning-fast responses.
+DEBBIE (Developer Virtual Intelligence Engine) is an advanced RAG (Retrieval-Augmented Generation) chatbot that intelligently processes and understands your Google Drive documents. Built with **LlamaIndex** for superior document chunking and retrieval, powered by **OpenAI gpt-4o-mini** for fast, accurate responses.
 
 ## 🌟 Key Features
 
@@ -18,8 +18,8 @@ DEBBIE (Developer Virtual Intelligence Engine) is an advanced RAG (Retrieval-Aug
 
 ### 🚀 **Advanced RAG Architecture**
 - **Vector Database**: ChromaDB for high-performance similarity search
-- **Embedding Model**: BAAI/bge-large-en-v1.5 via HuggingFace Inference API
-- **LLM**: Google Gemini 2.0 Flash for fast, accurate responses
+- **Embedding Model**: OpenAI text-embedding-3-small (1536-dim)
+- **LLM**: OpenAI gpt-4o-mini for fast, accurate responses
 - **Conversation Memory**: Context-aware conversations with history tracking
 
 ### 🔗 **Google Drive Integration**
@@ -53,8 +53,7 @@ DEBBIE (Developer Virtual Intelligence Engine) is an advanced RAG (Retrieval-Aug
 ### Prerequisites
 - Python 3.8+
 - Google Drive API credentials
-- HuggingFace API token
-- Google Gemini API key
+- OpenAI API key
 
 ### 1. Clone and Setup
 ```bash
@@ -74,8 +73,10 @@ Create a `.env` file in the project root:
 
 ```env
 # API Keys
-GEMINI_API_KEY=your_gemini_api_key_here
-HUGGINGFACE_TOKEN=your_hf_token_here
+OPENAI_API_KEY=your_openai_api_key_here
+# Optional overrides (defaults shown):
+# OPENAI_LLM_MODEL=gpt-4o-mini
+# OPENAI_EMBED_MODEL=text-embedding-3-small
 
 # Google Drive Configuration
 GOOGLE_SERVICE_ACCOUNT_JSON=keys/your-service-account.json
@@ -85,7 +86,15 @@ GOOGLE_DRIVE_FOLDER_ID=your_drive_folder_id_here
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=200
 TOP_K_RETRIEVAL=5
-BGE_NORMALIZE_EMBEDDINGS=true
+RETRIEVE_CANDIDATES=20
+SIMILARITY_CUTOFF=0.3
+
+# Smarter retrieval / resilience / caching (optional)
+ENABLE_RERANK=true
+ENABLE_QUERY_CONDENSE=true
+ENABLE_QUERY_CACHE=true
+RATE_LIMIT_ASK=20/minute
+MAX_CONCURRENT_QUERIES=8
 
 # Storage
 CHROMA_PERSIST_DIR=app/storage/chroma_db
@@ -109,12 +118,12 @@ python main.py
 graph TB
     A[Google Drive] -->|Files| B[Document Processor]
     B -->|Raw Text| C[LlamaIndex SentenceSplitter]
-    C -->|Smart Chunks| D[BGE Embeddings]
+    C -->|Smart Chunks| D[OpenAI Embeddings]
     D -->|Vectors| E[ChromaDB]
     F[User Query] -->|Question| G[RAG Service]
     G -->|Retrieve| E
     E -->|Context| G
-    G -->|Generate| H[Gemini 2.0 Flash]
+    G -->|Generate| H[OpenAI gpt-4o-mini]
     H -->|Response| I[User]
     
     subgraph "Smart Chunking Layer"
@@ -151,8 +160,13 @@ docker run -p 8000:8000 --env-file .env DEBBIE-chatbot
 |---------|---------|-------------|
 | `CHUNK_SIZE` | 1000 | Token size for document chunks (LlamaIndex optimized) |
 | `CHUNK_OVERLAP` | 200 | Overlap between chunks for context continuity |
-| `TOP_K_RETRIEVAL` | 5 | Number of relevant chunks to retrieve |
-| `BGE_NORMALIZE_EMBEDDINGS` | true | Normalize embeddings for better similarity |
+| `TOP_K_RETRIEVAL` | 5 | Number of relevant chunks returned after reranking |
+| `RETRIEVE_CANDIDATES` | 20 | Wide candidate set retrieved before reranking |
+| `SIMILARITY_CUTOFF` | 0.3 | Minimum similarity score to keep a chunk |
+| `ENABLE_RERANK` | true | LLM-rerank candidates down to top-k |
+| `ENABLE_QUERY_CONDENSE` | true | Rewrite follow-ups into standalone queries |
+| `ENABLE_QUERY_CACHE` | true | Cache answers for repeated queries |
+| `RATE_LIMIT_ASK` | 20/minute | Per-IP rate limit on `/ask` |
 
 ### LlamaIndex Optimization
 ```python
@@ -250,7 +264,7 @@ response = requests.post("http://localhost:8000/api/v1/ask", json={
 # DEBBIE's optimized chunking approach
 def create_smart_chunks(documents):
     parser = SentenceSplitter(
-        chunk_size=1000,        # Optimal for BGE embeddings
+        chunk_size=1000,        # Token size for document chunks
         chunk_overlap=200,      # 20% overlap for context
         separator=" ",          # Word-level splitting
         paragraph_separator="\n\n",  # Preserve document structure
@@ -288,16 +302,16 @@ flowchart TD
     C --> D[Similarity Search]
     D --> E[Context Ranking]
     E --> F[Prompt Construction]
-    F --> G[Gemini Generation]
+    F --> G[OpenAI Generation]
     G --> H[Response Post-processing]
     H --> I[User Response]
 ```
 
 ### 3. Smart Retrieval Strategy
-1. **Dense Retrieval**: BGE embeddings for semantic similarity
+1. **Dense Retrieval**: OpenAI embeddings for semantic similarity
 2. **Re-ranking**: SimilarityPostprocessor filters low-quality matches
 3. **Context Assembly**: Intelligent merging of retrieved chunks
-4. **Prompt Engineering**: Optimized prompts for Gemini 2.0 Flash
+4. **Prompt Engineering**: Optimized prompts for OpenAI gpt-4o-mini
 
 ## 🎯 Use Cases
 
@@ -359,17 +373,24 @@ services:
 ### Performance Tuning
 ```env
 # Embedding optimization
-EMBEDDING_BATCH_SIZE=32
-EMBEDDING_DEVICE=auto
-BGE_NORMALIZE_EMBEDDINGS=true
+EMBEDDING_BATCH_SIZE=64
 
 # Retrieval tuning
 TOP_K_RETRIEVAL=5
+RETRIEVE_CANDIDATES=20
 SIMILARITY_CUTOFF=0.3
+ENABLE_RERANK=true
 
-# Processing optimization
-MAX_WORKERS=4
-ENABLE_GPU=true
+# Resilience & caching
+RATE_LIMIT_ASK=20/minute
+MAX_CONCURRENT_QUERIES=8
+QUERY_TIMEOUT_SECONDS=60
+ENABLE_QUERY_CACHE=true
+QUERY_CACHE_TTL=900
+
+# OpenAI client
+OPENAI_MAX_RETRIES=3
+OPENAI_REQUEST_TIMEOUT=60
 ```
 
 ### Custom Chunking Strategies
@@ -456,8 +477,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - **LlamaIndex** - For the excellent RAG framework and smart chunking
 - **ChromaDB** - For the high-performance vector database
-- **Google Gemini** - For the powerful language model
-- **HuggingFace** - For the BGE embedding model
+- **OpenAI** - For the language model (gpt-4o-mini) and embeddings (text-embedding-3-small)
 - **FastAPI** - For the robust web framework
 
 ## 📞 Support
