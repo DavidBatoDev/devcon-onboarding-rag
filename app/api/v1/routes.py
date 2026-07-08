@@ -1,5 +1,7 @@
 # backend/app/api/v1/routes.py
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 from app.api.v1.models import AskRequest, AskResponse, RefreshStatus, FileProcessingDetail
 from app.services.llamaindex_service import rag_service
 from app.services.document_processor import document_processor
@@ -136,6 +138,44 @@ async def ask_question(request: Request, body: AskRequest):
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+
+
+@router.post("/ask/stream")
+@limiter.limit(settings.RATE_LIMIT_ASK)
+async def ask_question_stream(request: Request, body: AskRequest):
+    """Streaming variant of /ask — streams the answer as UTF-8 text chunks so the
+    client can render tokens in real time."""
+    if not body.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    logger.info(f"Received streaming query: {body.query}")
+    history_context = [{"role": msg.role, "content": msg.content} for msg in body.history]
+
+    def sync_token_gen():
+        yield from rag_service.query_stream(
+            body.query, history_context, body.top_k, body.temperature
+        )
+
+    async def event_stream():
+        # Hold a concurrency slot for the whole stream so bursts don't overwhelm the
+        # LLM provider, mirroring the non-streaming /ask guard. The blocking token
+        # generator is pumped on a worker thread to keep the event loop responsive.
+        async with _query_semaphore:
+            try:
+                async for chunk in iterate_in_threadpool(sync_token_gen()):
+                    yield chunk
+            except Exception as e:
+                logger.error(f"Error during streaming query: {e}")
+                yield "\n\n❌ The response was interrupted. Please try again."
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/stats", response_model=IndexStatsResponse)

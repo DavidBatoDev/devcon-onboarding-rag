@@ -27,6 +27,7 @@ import os
 import time
 import hashlib
 import threading
+from types import SimpleNamespace
 from typing import List, Optional, Any
 from pathlib import Path
 from cachetools import TTLCache
@@ -375,6 +376,28 @@ class LlamaIndexRAGService:
             nodes = nodes[:top_k]
         return nodes
 
+    def _build_general_prompt(self, question: str, conversation_context: str = "") -> str:
+        """Prompt for answering when no relevant documents were retrieved — natural,
+        conversational, persona-consistent, and honest about general advice. Used by
+        both the non-streaming fallback and the streaming (ungrounded) path so DEBBIE
+        responds to anything instead of refusing."""
+        prompt = (
+            "You are DEBBIE, the friendly DEVCON Officers' Onboarding Assistant. "
+            "You help DEVCON chapter officers with onboarding, chapter management, "
+            "events, and general questions. Reply warmly and concisely using markdown.\n"
+            "- For greetings or small talk, respond naturally and invite the user to "
+            "ask about their officer role.\n"
+            "- For DEVCON-specific questions you have no documents for, give helpful "
+            "general guidance and gently note it's general advice (suggest checking "
+            "official DEVCON resources or HQ when in doubt).\n"
+            "- Never invent specific DEVCON facts, names, dates, or policies.\n"
+            "- If the conversation is already ongoing, do not reintroduce yourself.\n"
+        )
+        if conversation_context:
+            prompt += f"\nRecent conversation:\n{conversation_context}\n"
+        prompt += f"\nUser: {question}\nDEBBIE:"
+        return prompt
+
     def _format_conversation_history(self, history: List[Dict[str, str]]) -> str:
         """Format conversation history into a readable context string"""
         if not history:
@@ -458,7 +481,18 @@ class LlamaIndexRAGService:
         )
 
         if not nodes:
-            return None, "No relevant documents found for your question.", retrieval_query
+            # No relevant documents — answer conversationally from general knowledge
+            # instead of refusing. Keeps DEBBIE's persona and handles greetings/chit-chat.
+            general_text = str(
+                LlamaSettings.llm.complete(
+                    self._build_general_prompt(question, conversation_context)
+                )
+            ).strip()
+            return (
+                SimpleNamespace(response=general_text or "Hi! How can I help you today?", source_nodes=[]),
+                None,
+                retrieval_query,
+            )
 
         # Create context-aware prompt using the enhanced prompt engine if available
         if hasattr(self, 'prompt_engine') and self.prompt_engine:
@@ -497,7 +531,7 @@ At the end, add EXACTLY ONE marker:
 - "SHOW_REFERENCES: false" if using general knowledge
 
 Answer:"""
-        
+
         # Insert the context prompt (which now includes conversation history if needed)
         formatted_template = qa_template_str.replace("{context_prompt}", context_prompt)
 
@@ -733,6 +767,113 @@ QUESTION: {question}
             with self._query_cache_lock:
                 self._query_cache[key] = answer
         return answer
+
+    def query_stream(self, question: str, history: List[Dict[str, str]] = None,
+                     top_k: int = None, temperature: float = None):
+        """Streaming variant of :meth:`query`. A generator that yields answer text
+        chunks as they are produced. Grounded answers stream from the response
+        synthesizer and append a deduped sources footer; ungrounded answers stream a
+        general conversational reply (so DEBBIE responds to anything)."""
+        try:
+            if not self.query_engine:
+                yield "❌ RAG system not initialized. Please add documents first."
+                return
+
+            history = history or []
+            conversation_context = self._format_conversation_history(history) if history else ""
+            retrieval_query = self._condense_question(question, history) if history else question
+
+            final_top_k = top_k or settings.TOP_K_RETRIEVAL
+            retriever = self._get_retriever(settings.RETRIEVE_CANDIDATES)
+            nodes = retriever.retrieve(retrieval_query)
+            nodes = self._postprocess_nodes(nodes, retrieval_query, final_top_k)
+
+            # Optional per-request temperature override.
+            synth_llm = None
+            if temperature is not None:
+                try:
+                    synth_llm = OpenAI(
+                        api_key=settings.OPENAI_API_KEY,
+                        model=settings.OPENAI_LLM_MODEL,
+                        temperature=temperature,
+                        max_tokens=settings.MAX_OUTPUT_TOKENS,
+                        timeout=settings.OPENAI_REQUEST_TIMEOUT,
+                        max_retries=settings.OPENAI_MAX_RETRIES,
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not apply temperature override: {e}")
+
+            # Ungrounded: stream a general conversational reply (no sources/footer).
+            if not nodes:
+                llm = synth_llm or LlamaSettings.llm
+                for chunk in llm.stream_complete(
+                    self._build_general_prompt(question, conversation_context)
+                ):
+                    if chunk.delta:
+                        yield chunk.delta
+                return
+
+            # Grounded: build the context prompt and stream the synthesized answer.
+            has_relevant_context = bool(nodes) and any(
+                node.text.strip() for node in nodes if node.text.strip()
+            )
+            if getattr(self, "prompt_engine", None):
+                context_prompt = self.prompt_engine.create_enhanced_context_prompt(
+                    nodes, question, has_relevant_context, conversation_context
+                )
+            else:
+                context_prompt = self._create_basic_context_prompt(
+                    nodes, question, has_relevant_context
+                )
+
+            # Streaming QA template WITHOUT the SHOW_REFERENCES marker (so it can't
+            # leak mid-stream); sources are appended deterministically after tokens.
+            qa_template_str = """{context_prompt}
+
+💡 RESPONSE RULES:
+1. Use the provided context first; if it lacks the answer, use general knowledge and say so.
+2. Never invent specific DEVCON facts, names, dates, or policies.
+3. Keep it friendly, concise, and practical for chapter officers (minimal emojis).
+4. Do not reintroduce yourself in a continuing conversation.
+
+Answer:"""
+            formatted_template = qa_template_str.replace("{context_prompt}", context_prompt)
+            qa_template = PromptTemplate(formatted_template)
+
+            response_synthesizer = get_response_synthesizer(
+                text_qa_template=qa_template,
+                response_mode="compact",
+                streaming=True,
+                llm=synth_llm,
+            )
+            streaming_response = response_synthesizer.synthesize(question, nodes=nodes)
+
+            for tok in streaming_response.response_gen:
+                if tok:
+                    yield tok
+
+            # Append deduped sources (rendered as "View Document" chips by the UI).
+            unique_sources = self._deduplicate_sources(nodes, max_sources=3)
+            if unique_sources:
+                footer = "\n\n📚 **Sources Referenced:**\n"
+                for i, node in enumerate(unique_sources, 1):
+                    source_info = node.metadata.get('title', node.metadata.get('source', 'Unknown'))
+                    file_id = node.metadata.get('file_id')
+                    footer += f"{i}. {source_info}\n"
+                    if file_id:
+                        footer += f"   [[View Document]](https://drive.google.com/file/d/{file_id}/view)\n"
+                yield footer
+
+            yield ("\n\n💡 I'm currently on Beta and based my answer on available memo "
+                   "documents, FAQs, and links trained as of June 2025. When in doubt, "
+                   "check [https://linktr.ee/fordevconchapterleads](https://linktr.ee/fordevconchapterleads) "
+                   "or contact HQ hello@devcon.ph for confirmation!")
+
+        except Exception as e:
+            logger.error(f"❌ Error in query_stream: {e}")
+            import traceback
+            traceback.print_exc()
+            yield "❌ I encountered an error while processing your question. Please try rephrasing or contact support."
 
     def _query_cache_key(self, question, history, top_k, temperature) -> str:
         """Build a stable cache key from the question + history + retrieval params."""
