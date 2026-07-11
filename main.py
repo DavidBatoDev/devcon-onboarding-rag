@@ -42,13 +42,23 @@ def health_check():
         "uptime_human": str(timedelta(seconds=int(uptime)))
     }
 
-# Configure CORS
+# Configure CORS — restricted to the deployed frontend + local dev.
+# Extra origins can be added via CORS_EXTRA_ORIGINS (comma-separated).
+_origins = [
+    "https://devcon-onboarding-web.vercel.app",
+    "http://localhost:8080",
+    "http://localhost:8081",
+    "http://localhost:5173",
+]
+_origins += [o.strip() for o in os.environ.get("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development only
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_origins,
+    # Vercel preview deployments live on *.vercel.app subdomains
+    allow_origin_regex=r"https://devcon-onboarding-web[a-z0-9-]*\.vercel\.app",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "X-Admin-Token"],
 )
 
 # Register API routes

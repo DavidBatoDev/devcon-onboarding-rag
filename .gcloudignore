@@ -20,3 +20,9 @@ compilation.log
 
 # NOTE: app/storage/ is intentionally NOT ignored — it is the baked index.
 backups/
+eval/
+tests/
+docs/
+server_v2.log
+pytest.ini
+requirements-dev.txt

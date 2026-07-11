@@ -50,3 +50,4 @@ compilation.log
 backups/
 eval/golden.jsonl
 eval/results/
+server_v2.log

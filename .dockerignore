@@ -30,3 +30,9 @@ Dockerfile
 
 # NOTE: app/storage/ is intentionally NOT ignored — the prebuilt index is baked in.
 backups/
+eval/
+tests/
+docs/
+server_v2.log
+pytest.ini
+requirements-dev.txt
