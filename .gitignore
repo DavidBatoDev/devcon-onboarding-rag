@@ -48,3 +48,5 @@ app/storage/
 temp.docx
 compilation.log
 backups/
+eval/golden.jsonl
+eval/results/
