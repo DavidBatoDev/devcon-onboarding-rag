@@ -19,3 +19,4 @@ temp_*.docx
 compilation.log
 
 # NOTE: app/storage/ is intentionally NOT ignored — it is the baked index.
+backups/

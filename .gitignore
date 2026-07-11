@@ -47,3 +47,4 @@ app/storage/
 # Temp / build artifacts
 temp.docx
 compilation.log
+backups/

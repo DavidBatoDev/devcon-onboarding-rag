@@ -1,0 +1,2 @@
+# Dev/test-only dependencies (not shipped in the Docker image)
+pytest==8.4.1

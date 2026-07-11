@@ -29,3 +29,4 @@ Dockerfile
 .dockerignore
 
 # NOTE: app/storage/ is intentionally NOT ignored — the prebuilt index is baked in.
+backups/

@@ -41,9 +41,10 @@ class Settings:
     # Vector Store Configuration
     VECTOR_STORE_TYPE = os.getenv("VECTOR_STORE_TYPE", "chroma")
     CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "app/storage/chroma_db")
-    # New collection name: OpenAI embeddings are 1536-dim and incompatible with the
-    # old 1024-dim BGE collection, so a fresh collection is required.
-    CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "devcon_documents_openai_1536")
+    # v2 collection: section-aware 512-token chunks, cosine space. The legacy
+    # l2 collection (devcon_documents_openai_1536) is kept in the same store as
+    # a rollback lever — flip this env var to revert without a redeploy.
+    CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "devcon_chunks_v2")
 
     # Embedding Configuration (OpenAI)
     OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
@@ -60,15 +61,27 @@ class Settings:
     QUERY_TIMEOUT_SECONDS = float(os.getenv("QUERY_TIMEOUT_SECONDS", "60"))
     DRIVE_MAX_RETRIES = int(os.getenv("DRIVE_MAX_RETRIES", "5"))
 
-    # --- Smarter retrieval ---
-    # Retrieve a wide candidate set, then rerank/filter down to TOP_K_RETRIEVAL.
+    # --- Smarter retrieval (v2 pipeline) ---
+    # Retrieve a wide candidate set (vector + BM25, RRF-fused), gate on the best
+    # raw cosine similarity, then keep TOP_K_RETRIEVAL for synthesis.
     RETRIEVE_CANDIDATES = int(os.getenv("RETRIEVE_CANDIDATES", "20"))
-    SIMILARITY_CUTOFF = float(os.getenv("SIMILARITY_CUTOFF", "0.3"))
-    ENABLE_RERANK = os.getenv("ENABLE_RERANK", "true").lower() == "true"
+    # Pre-fusion floor on the vector leg (cosine similarity).
+    SIMILARITY_CUTOFF = float(os.getenv("SIMILARITY_CUTOFF", "0.25"))
+    BM25_TOP_K = int(os.getenv("BM25_TOP_K", "10"))
+    # Confidence gate tiers (calibrated via scripts/inspect_retrieval.py + eval):
+    #   >= STRONG -> grounded; STRONG..WEAK -> grounded but hedged; < WEAK -> honest refusal.
+    CONFIDENCE_STRONG = float(os.getenv("CONFIDENCE_STRONG", "0.50"))
+    CONFIDENCE_WEAK = float(os.getenv("CONFIDENCE_WEAK", "0.35"))
+    # LLM rerank: "off" | "nonstream" | "always". Default off — it adds seconds of
+    # latency; the eval harness decides whether it earns its keep.
+    RERANK_MODE = os.getenv("RERANK_MODE", "off")
     ENABLE_QUERY_CONDENSE = os.getenv("ENABLE_QUERY_CONDENSE", "true").lower() == "true"
     CONDENSE_HISTORY_TURNS = int(os.getenv("CONDENSE_HISTORY_TURNS", "6"))
-    ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "false").lower() == "true"
-    BM25_TOP_K = int(os.getenv("BM25_TOP_K", "10"))
+    PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "v2")
+    KB_VERSION = os.getenv("KB_VERSION", "2025-06")
+    # Admin gate for the local-only Drive endpoints (unset -> endpoints 403).
+    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+    RATE_LIMIT_RETRIEVE = os.getenv("RATE_LIMIT_RETRIEVE", "10/minute")
 
     # --- Caching ---
     ENABLE_QUERY_CACHE = os.getenv("ENABLE_QUERY_CACHE", "true").lower() == "true"
