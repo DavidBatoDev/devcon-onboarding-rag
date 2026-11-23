@@ -1,2 +1,7 @@
-# Dev/test-only dependencies (not shipped in the Docker image)
+# Local development, tests, eval and the Lambda build (not shipped).
+-r requirements.txt
+tiktoken==0.9.0
+docx2txt==0.9
+boto3==1.40.70
 pytest==8.4.1
+httpx==0.28.1

@@ -1,14 +1,16 @@
 """Unified answer pipeline (v2): one code path for streaming AND non-streaming.
 
 Stages: condense -> hybrid retrieve (vector + BM25, RRF fusion with raw cosine
-preserved) -> confidence gate -> optional LLM rerank -> single prompt ->
-stream synthesis -> deterministic citation sanitation.
+preserved) -> confidence gate -> single prompt -> stream synthesis ->
+deterministic citation sanitation.
 
 Design notes:
-- The vector leg queries Chroma directly (query embedding -> ids + cosine
-  distances) and maps ids onto the in-memory node corpus, so the confidence
-  gate always sees TRUE cosine similarities. RRF scores are rank-only and are
-  never used for gating (fusing scores would destroy the gate's semantics).
+- The vector leg is an exact cosine search over the in-memory index
+  (index_store.IndexStore: ids + cosine distances), so the confidence gate
+  always sees TRUE cosine similarities. RRF scores are rank-only and are never
+  used for gating (fusing scores would destroy the gate's semantics).
+- The LLM rerank stage (LlamaIndex LLMRerank, off in production) was dropped
+  with LlamaIndex; the eval showed hybrid retrieval alone meets the bar.
 - Grounding is decided deterministically by the gate BEFORE synthesis; the
   LLM is never trusted to self-report whether it used the documents.
 """
@@ -124,14 +126,18 @@ class AnswerResult:
 class AnswerPipeline:
     """Everything injected for testability: `llm_factory(temperature)` returns
     an object with .complete/.stream_complete; `embed_fn(str)` returns a query
-    embedding; `chroma_query(embedding, n)` returns (ids, distances); `nodes`
-    is {node_id: TextNode-like} with .text/.metadata."""
+    embedding; `chroma_query(embedding, n)` returns (ids, cosine distances);
+    `nodes` is {node_id: node} with .text/.metadata; `condense_llm` (optional)
+    rewrites follow-ups; `kb_version` labels answers with the index version."""
 
-    def __init__(self, llm_factory, embed_fn, chroma_query, nodes: Dict[str, object]):
+    def __init__(self, llm_factory, embed_fn, chroma_query, nodes: Dict[str, object],
+                 condense_llm=None, kb_version: str = ""):
         self.llm_factory = llm_factory
         self.embed_fn = embed_fn
         self.chroma_query = chroma_query
         self.nodes = nodes
+        self.condense_llm = condense_llm
+        self.kb_version = kb_version
         self._bm25 = None
         self._bm25_ids: List[str] = []
         self._build_bm25()
@@ -161,8 +167,8 @@ class AnswerPipeline:
             return question
         try:
             convo = prompts.format_history(history, settings.CONDENSE_HISTORY_TURNS)
-            condensed = str(self.llm_factory(None).complete(
-                prompts.build_condense_prompt(question, convo))).strip()
+            llm = self.condense_llm or self.llm_factory(None)
+            condensed = str(llm.complete(prompts.build_condense_prompt(question, convo))).strip()
             if condensed and len(condensed) <= 1000:
                 logger.info("Condensed query: %s", condensed)
                 return condensed
@@ -211,27 +217,6 @@ class AnswerPipeline:
         if top >= settings.CONFIDENCE_WEAK:
             return "weak"
         return "none"
-
-    def _rerank(self, question: str, candidates: List[Candidate], top_k: int,
-                streaming: bool) -> List[Candidate]:
-        mode = settings.RERANK_MODE
-        if mode == "off" or (mode == "nonstream" and streaming) or not candidates:
-            return candidates[:top_k]
-        try:
-            from llama_index.core.postprocessor import LLMRerank
-            from llama_index.core.schema import NodeWithScore, QueryBundle
-
-            nws = [NodeWithScore(node=self.nodes[c.node_id], score=c.rrf)
-                   for c in candidates if c.node_id in self.nodes]
-            reranked = LLMRerank(top_n=top_k, choice_batch_size=5).postprocess_nodes(
-                nws, query_bundle=QueryBundle(question))
-            order = {n.node.node_id: i for i, n in enumerate(reranked)}
-            kept = [c for c in candidates if c.node_id in order]
-            kept.sort(key=lambda c: order[c.node_id])
-            return kept[:top_k] or candidates[:top_k]
-        except Exception as e:
-            logger.warning("LLM rerank failed, using fused order: %s", e)
-            return candidates[:top_k]
 
     def build_sources(self, candidates: List[Candidate]) -> List[SourceRef]:
         refs = []
@@ -284,7 +269,7 @@ class AnswerPipeline:
             answer="",
             model=settings.OPENAI_LLM_MODEL,
             request_id=uuid.uuid4().hex[:12],
-            kb_version=settings.KB_VERSION,
+            kb_version=self.kb_version,
         )
         yield "meta", {"request_id": result.request_id, "model": result.model,
                        "kb_version": result.kb_version, "cached": False}
@@ -301,7 +286,7 @@ class AnswerPipeline:
             tier = self.gate(candidates)
             timings["retrieval_ms"] = int((time.perf_counter() - t) * 1000)
 
-            # 3. optional rerank + sources
+            # 3. sources
             final_top_k = top_k or settings.TOP_K_RETRIEVAL
             history_block = prompts.format_history(history)
             llm = self.llm_factory(temperature)
@@ -311,10 +296,7 @@ class AnswerPipeline:
                 yield "sources", {"grounded": False, "confidence": "none", "sources": []}
                 prompt = prompts.build_general_prompt(question, history_block)
             else:
-                t = time.perf_counter()
-                final = self._rerank(retrieval_query, candidates, final_top_k, streaming=True)
-                timings["rerank_ms"] = int((time.perf_counter() - t) * 1000)
-                result.sources = self.build_sources(final)
+                result.sources = self.build_sources(candidates[:final_top_k])
                 result.grounded, result.confidence = True, tier
                 yield "sources", {"grounded": True, "confidence": tier,
                                   "sources": [asdict(s) for s in result.sources]}
@@ -348,6 +330,7 @@ class AnswerPipeline:
                 "event": "answer", "request_id": result.request_id, "tier": result.confidence,
                 "grounded": result.grounded, "sources": len(result.sources),
                 "cited": cited, "timings": timings, "cached": False,
+                "model": result.model, "kb_version": result.kb_version,
             }))
 
             if settings.ENABLE_QUERY_CACHE and result.answer:
@@ -374,15 +357,15 @@ class AnswerPipeline:
             return AnswerResult(answer=error or "Something went wrong. Please try again.",
                                 model=settings.OPENAI_LLM_MODEL,
                                 request_id=uuid.uuid4().hex[:12],
-                                kb_version=settings.KB_VERSION)
+                                kb_version=self.kb_version)
         return result
 
     # ------------------------------------------------------------------ cache
 
     def _cache_key(self, question, history, top_k, temperature) -> str:
         hist = json.dumps(history or [], sort_keys=True, default=str)
-        raw = (f"{settings.PIPELINE_VERSION}|{(question or '').strip().lower()}|"
-               f"{hist}|{top_k}|{temperature}")
+        raw = (f"{settings.PIPELINE_VERSION}|{self.kb_version}|{settings.OPENAI_LLM_MODEL}|"
+               f"{(question or '').strip().lower()}|{hist}|{top_k}|{temperature}")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def invalidate_cache(self):

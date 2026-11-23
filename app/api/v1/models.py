@@ -77,6 +77,8 @@ class FeedbackRequest(BaseModel):
 class IndexStatsResponse(BaseModel):
     status: str
     document_count: int
+    index_version: Optional[str] = None
+    index_created: Optional[str] = None
     collection_name: Optional[str] = None
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
