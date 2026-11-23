@@ -118,11 +118,17 @@ def test_feedback_is_stored_without_ip(client):
     assert not any("ip" in k.lower() for k in rec)
 
 
-def test_cors_allowed_vs_unknown_origin(client):
-    ok = client.get("/api/v1/status", headers={"Origin": "https://devcon-onboarding-web.vercel.app"})
-    bad = client.get("/api/v1/status", headers={"Origin": "https://evil.example.com"})
-    assert ok.headers.get("access-control-allow-origin") == "https://devcon-onboarding-web.vercel.app"
-    assert "access-control-allow-origin" not in bad.headers
+@pytest.mark.parametrize("origin,allowed", [
+    ("https://devcon-onboarding-web.vercel.app", True),
+    ("https://devcon-onboarding-h1p8ddl2n-davids-projects-cc0a1acc.vercel.app", True),
+    ("https://devcon-onboarding-web-git-aws-serverless-davids-projects-cc0a1acc.vercel.app", True),
+    ("https://devcon-onboarding-web-evil.vercel.app", False),       # someone else's project
+    ("https://devcon-onboarding-x-other-team.vercel.app", False),
+    ("https://evil.example.com", False),
+])
+def test_cors_origins(client, origin, allowed):
+    r = client.get("/api/v1/status", headers={"Origin": origin})
+    assert (r.headers.get("access-control-allow-origin") == origin) is allowed
 
 
 def test_admin_drive_endpoints_are_gone(client):

@@ -101,7 +101,9 @@ _origins += [o.strip() for o in os.environ.get("CORS_EXTRA_ORIGINS", "").split("
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_origin_regex=r"https://devcon-onboarding-web[a-z0-9-]*\.vercel\.app",
+    # Vercel previews of this team only: devcon-onboarding-<hash>-<team>.vercel.app and
+    # devcon-onboarding-web-git-<branch>-<team>.vercel.app (Vercel shortens the project name).
+    allow_origin_regex=r"https://devcon-onboarding-[a-z0-9-]+-davids-projects-cc0a1acc\.vercel\.app",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Accept"],

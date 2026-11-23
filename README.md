@@ -96,7 +96,7 @@ cd server
 python -m venv .venv && .venv/Scripts/pip install -r requirements-dev.txt
 echo "OPENAI_API_KEY=sk-..." > .env       # see app/core/config.py for all knobs
 .venv/Scripts/python main.py              # http://localhost:8000, index from app/storage/index/
-.venv/Scripts/python -m pytest            # 61 tests, no network
+.venv/Scripts/python -m pytest            # 66 tests, no network
 .venv/Scripts/python -m eval.run_eval --mode full                       # in-process eval
 .venv/Scripts/python -m eval.run_eval --mode full --base-url <api_url>  # eval a deployment
 ```
