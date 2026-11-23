@@ -97,9 +97,81 @@ def default_tokenizer() -> Callable[[str], int]:
     return lambda s: len(enc.encode(s, disallowed_special=()))
 
 
-def chunk_document_text(text: str) -> List[Chunk]:
-    """One-call helper: section-split + pack a cleaned document text."""
-    from llama_index.core.node_parser import SentenceSplitter
+# Coarse -> fine split patterns; each piece keeps its trailing delimiter/whitespace
+# so joining pieces reproduces the text exactly.
+_SPLIT_PATTERNS = (
+    re.compile(r".+?(?:\n{2,}|$)", re.S),                       # paragraphs
+    re.compile(r".+?(?:[.!?](?=\s)\s*|\n+|$)", re.S),           # sentences / lines
+    re.compile(r".+?(?:[,;:](?=\s)\s*|$)", re.S),               # clauses
+    re.compile(r"\S+\s*|\s+"),                                  # words
+)
 
-    splitter = SentenceSplitter(chunk_size=CHUNK_TOKENS, chunk_overlap=CHUNK_OVERLAP_TOKENS)
-    return chunk_sections(split_sections(text), splitter, default_tokenizer())
+
+class SentenceSplitter:
+    """Token-budgeted splitter for sections larger than one chunk (replaces
+    LlamaIndex's SentenceSplitter): split recursively paragraph -> sentence ->
+    clause -> word until every piece fits, then greedily merge pieces up to
+    `chunk_size` tokens, carrying ~`chunk_overlap` tokens of trailing pieces
+    into the next chunk."""
+
+    def __init__(self, chunk_size: int = CHUNK_TOKENS, chunk_overlap: int = CHUNK_OVERLAP_TOKENS,
+                 ntokens: Optional[Callable[[str], int]] = None):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.ntokens = ntokens or default_tokenizer()
+
+    def _pieces(self, text: str, level: int = 0) -> List[str]:
+        if self.ntokens(text) <= self.chunk_size or level >= len(_SPLIT_PATTERNS):
+            if level >= len(_SPLIT_PATTERNS) and self.ntokens(text) > self.chunk_size:
+                step = max(1, len(text) // (self.ntokens(text) // self.chunk_size + 1))
+                return [text[i:i + step] for i in range(0, len(text), step)]
+            return [text]
+        parts = [p for p in _SPLIT_PATTERNS[level].findall(text) if p]
+        if len(parts) <= 1:
+            return self._pieces(text, level + 1)
+        out: List[str] = []
+        for p in parts:
+            out.extend(self._pieces(p, level + 1) if self.ntokens(p) > self.chunk_size else [p])
+        return out
+
+    def split_text(self, text: str) -> List[str]:
+        chunks: List[str] = []
+        cur: List[Tuple[str, int]] = []
+        cur_tokens = 0
+        for piece in self._pieces(text):
+            n = self.ntokens(piece)
+            if cur and cur_tokens + n > self.chunk_size:
+                chunks.append("".join(p for p, _ in cur).strip())
+                overlap: List[Tuple[str, int]] = []
+                total = 0
+                for p, pn in reversed(cur):
+                    if total + pn > self.chunk_overlap:
+                        break
+                    overlap.insert(0, (p, pn))
+                    total += pn
+                cur, cur_tokens = overlap, total
+            cur.append((piece, n))
+            cur_tokens += n
+        if cur:
+            chunks.append("".join(p for p, _ in cur).strip())
+        return [c for c in chunks if c]
+
+
+def clean_text(text: str) -> str:
+    """Normalise extracted document text (docx2txt / table-export artifacts)."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s in ("nan", "nan:"):
+            continue
+        lines.append(re.sub(r"^nan:\s*", "", line).rstrip())
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+    return text.strip() + "\n"
+
+
+def chunk_document_text(text: str, ntokens: Optional[Callable[[str], int]] = None) -> List[Chunk]:
+    """One-call helper: section-split + pack a cleaned document text."""
+    ntokens = ntokens or default_tokenizer()
+    splitter = SentenceSplitter(CHUNK_TOKENS, CHUNK_OVERLAP_TOKENS, ntokens=ntokens)
+    return chunk_sections(split_sections(text), splitter, ntokens)
